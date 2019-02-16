@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"syscall"
 	"testing"
 
 	"github.com/pkg/errors"
@@ -83,6 +84,14 @@ func TestBridge(t *testing.T) {
 		if want, got := "pong", string(buf[:n]); want != got {
 			t.Errorf("want msg %q, got %q", want, got)
 		}
+
+		if err := lnUDP.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := lnUDP.Accept(); err != syscall.EINVAL {
+			t.Errorf("want syscall.EINVAL err on closed accept, got %q", err)
+		}
 	})
 
 	t.Run("TCP", func(t *testing.T) {
@@ -149,11 +158,24 @@ func TestBridge(t *testing.T) {
 				errc <- errors.Errorf("want err %q, got %q", io.EOF, err)
 			}
 
+			if err := client.Close(); err != nil {
+				errc <- err
+				return
+			}
+
 			close(errc)
 		}()
 
 		if err := <-errc; err != nil {
 			t.Fatal(err)
+		}
+
+		if err := lnTCP.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := lnTCP.Accept(); err != syscall.EINVAL {
+			t.Errorf("want syscall.EINVAL err on closed accept, got %q", err)
 		}
 	})
 }

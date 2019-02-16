@@ -3,6 +3,8 @@ package networking
 import (
 	"io"
 	"net"
+	"sync"
+	"syscall"
 )
 
 // NAT proxies egress connections from an internal network to an external
@@ -11,22 +13,39 @@ import (
 type NAT struct {
 	EgressListener net.Listener
 	EgressDial     func(net.Addr) (net.Conn, error)
+
+	stopo sync.Once
 }
 
 // Run proxies connections from an internal to an external network.
 func (n *NAT) Run() error {
+	var wg sync.WaitGroup
+
 	for {
 		conn, err := n.EgressListener.Accept()
+		if err == syscall.EINVAL {
+			break
+		}
 		if err != nil {
 			return err
 		}
 
-		go n.forward(conn)
+		wg.Add(1)
+		go func(conn net.Conn) {
+			defer wg.Done()
+
+			n.forward(conn)
+		}(conn)
 	}
+
+	wg.Wait()
+	return nil
 }
 
 // Stop interrupts n.
-func (n *NAT) Stop(err error) {}
+func (n *NAT) Stop(err error) {
+	n.stopo.Do(func() { n.EgressListener.Close() })
+}
 
 func (n *NAT) forward(client net.Conn) {
 	server, err := n.EgressDial(client.LocalAddr())

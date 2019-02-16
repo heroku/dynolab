@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/netstack/tcpip"
@@ -28,7 +29,7 @@ type Bridge struct {
 	MaxInFlight int
 
 	routes    []route
-	listeners []listenerChan
+	listeners []*listenerChan
 
 	inito sync.Once
 }
@@ -162,7 +163,7 @@ func (b *Bridge) Listen(network, address string) (net.Listener, error) {
 		return nil, err
 	}
 
-	ln := make(listenerChan, b.MaxInFlight)
+	ln := newListenerChan(b.MaxInFlight)
 	for _, network := range networks {
 		b.routes = append(b.routes, route{network, cidr, port})
 		b.listeners = append(b.listeners, ln)
@@ -196,11 +197,13 @@ func (b *Bridge) forwardTCP(req *tcp.ForwarderRequest) {
 	}
 
 	if ln, match := b.matchRoute(dstAddr.Network(), dstAddr.IP, dstAddr.Port); match {
-		ln <- &tcpConn{
+		conn := &tcpConn{
 			localAddr:  dstAddr,
 			remoteAddr: srcAddr,
 			req:        req,
 		}
+
+		ln.send(conn)
 	}
 }
 
@@ -224,15 +227,17 @@ func (b *Bridge) forwardUDP(req *udp.ForwarderRequest) {
 			panic("TODO: figure out how to handle: " + terr.String())
 		}
 
-		ln <- &udpConn{
+		conn := &udpConn{
 			Conn:       gonet.NewConn(&wq, ep),
 			localAddr:  dstAddr,
 			remoteAddr: srcAddr,
 		}
+
+		ln.send(conn)
 	}
 }
 
-func (b *Bridge) matchRoute(network string, ip net.IP, port int) (listenerChan, bool) {
+func (b *Bridge) matchRoute(network string, ip net.IP, port int) (*listenerChan, bool) {
 	for i, route := range b.routes {
 		if route.network != network {
 			continue
@@ -255,22 +260,53 @@ type route struct {
 	port    uint16
 }
 
-type listenerChan chan net.Conn
+type listenerChan struct {
+	sync.Mutex
 
-func (l listenerChan) Accept() (net.Conn, error) {
-	conn, ok := <-l
+	ch chan net.Conn
+}
+
+func newListenerChan(size int) *listenerChan {
+	return &listenerChan{
+		ch: make(chan net.Conn, size),
+	}
+}
+
+func (l *listenerChan) Accept() (net.Conn, error) {
+	l.Lock()
+	ch := l.ch
+	l.Unlock()
+
+	if ch == nil {
+		return nil, syscall.EINVAL
+	}
+
+	conn, ok := <-ch
 	if !ok {
-		return nil, errors.New("listener closed")
+		return nil, syscall.EINVAL
 	}
 	return conn, nil
 }
 
-func (l listenerChan) Close() error {
-	close(l)
+func (l *listenerChan) Close() error {
+	l.Lock()
+	defer l.Unlock()
+
+	close(l.ch)
+	l.ch = nil
 	return nil
 }
 
-func (l listenerChan) Addr() net.Addr { return nil }
+func (l *listenerChan) Addr() net.Addr { return nil }
+
+func (l *listenerChan) send(conn net.Conn) {
+	l.Lock()
+	defer l.Unlock()
+
+	if l.ch != nil {
+		l.ch <- conn
+	}
+}
 
 type tcpConn struct {
 	net.Conn
@@ -296,12 +332,12 @@ func (c *tcpConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *tcpConn) Close() error {
-	c.connecto.Do(c.reset)
-	if c.Conn == nil {
-		return nil
+	if c.Conn != nil {
+		return c.Conn.Close()
 	}
 
-	return c.Conn.Close()
+	c.connecto.Do(c.reset)
+	return nil
 }
 
 func (c *tcpConn) LocalAddr() net.Addr  { return c.localAddr }
