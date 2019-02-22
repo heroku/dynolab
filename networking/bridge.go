@@ -28,6 +28,7 @@ type Bridge struct {
 	DialTimeout time.Duration
 	MaxInFlight int
 
+	routemu   sync.RWMutex
 	routes    []route
 	listeners []*listenerChan
 
@@ -49,7 +50,7 @@ func (b *Bridge) Dial(ctx context.Context, laddr, raddr net.Addr) (net.Conn, err
 	case "udp", "udp4":
 		return b.dialUDP(laddr.(*net.UDPAddr), raddr.(*net.UDPAddr))
 	case "tcp", "tcp4":
-		return b.dialTCP(laddr.(*net.TCPAddr), raddr.(*net.TCPAddr))
+		return b.dialTCP(ctx, laddr.(*net.TCPAddr), raddr.(*net.TCPAddr))
 	default:
 		return nil, errors.New("dial: unknown network")
 	}
@@ -98,7 +99,7 @@ func (b *Bridge) dialUDP(laddr, raddr *net.UDPAddr) (net.Conn, error) {
 	}, nil
 }
 
-func (b *Bridge) dialTCP(laddr, raddr *net.TCPAddr) (net.Conn, error) {
+func (b *Bridge) dialTCP(ctx context.Context, laddr, raddr *net.TCPAddr) (net.Conn, error) {
 	srcAddr := tcpip.FullAddress{
 		Addr: tcpip.Address(laddr.IP.To4()),
 		Port: uint16(laddr.Port),
@@ -130,8 +131,12 @@ func (b *Bridge) dialTCP(laddr, raddr *net.TCPAddr) (net.Conn, error) {
 	}
 
 	if terr = ep.Connect(dstAddr); terr == tcpip.ErrConnectStarted {
-		<-notifyCh
-		terr = ep.GetSockOpt(tcpip.ErrorOption{})
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-notifyCh:
+			terr = ep.GetSockOpt(tcpip.ErrorOption{})
+		}
 	}
 	if terr != nil {
 		ep.Close()
@@ -162,6 +167,9 @@ func (b *Bridge) Listen(network, address string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	b.routemu.Lock()
+	defer b.routemu.Unlock()
 
 	ln := newListenerChan(b.MaxInFlight)
 	for _, network := range networks {
@@ -238,6 +246,9 @@ func (b *Bridge) forwardUDP(req *udp.ForwarderRequest) {
 }
 
 func (b *Bridge) matchRoute(network string, ip net.IP, port int) (*listenerChan, bool) {
+	b.routemu.RLock()
+	defer b.routemu.RUnlock()
+
 	for i, route := range b.routes {
 		if route.network != network {
 			continue
@@ -338,6 +349,30 @@ func (c *tcpConn) Close() error {
 
 	c.connecto.Do(c.reset)
 	return nil
+}
+
+// CloseRead shuts down the reading side of the TCP connection. Most callers
+// should just use Close.
+func (c *tcpConn) CloseRead() error {
+	cwc, ok := c.Conn.(interface {
+		CloseRead() error
+	})
+	if !ok {
+		panic("impossible")
+	}
+	return cwc.CloseRead()
+}
+
+// CloseWrite shuts down the writing side of the TCP connection. Most callers
+// should just use Close.
+func (c *tcpConn) CloseWrite() error {
+	cwc, ok := c.Conn.(interface {
+		CloseWrite() error
+	})
+	if !ok {
+		panic("impossible")
+	}
+	return cwc.CloseWrite()
 }
 
 func (c *tcpConn) LocalAddr() net.Addr  { return c.localAddr }
